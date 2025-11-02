@@ -49,7 +49,7 @@ class SB3Agent(Agent):
 
     def _initialize(self) -> None:
         if self.file_path is None:
-            self.model = self.sb3_class("MlpPolicy", self.env, verbose=0, n_steps=30*90*3, batch_size=128, ent_coef=0.01)
+            self.model = self.sb3_class("MlpPolicy", self.env, learning_rate=3e-5, verbose=0, n_steps=30*90*3, batch_size=128, ent_coef=0.01)
             del self.env
         else:
             self.model = self.sb3_class.load(self.file_path)
@@ -63,6 +63,37 @@ class SB3Agent(Agent):
 
     def predict(self, obs):
         action, _ = self.model.predict(obs)
+        # w,a,s,d,space,g,h,j,k,l = action
+        pos = self.obs_helper.get_section(obs, 'player_pos')
+        opp_pos = self.obs_helper.get_section(obs, 'opponent_pos')
+        
+        # self.obs_helper.print_all_sections()
+
+        x, y = pos[0], pos[1]
+
+        dist = ((opp_pos[0]-x)**2 + (opp_pos[1]-y)**2)**0.5
+        if dist < 3:
+            # opp if left, face left
+            if opp_pos[0] < x:
+                action[1] = 1
+                action[3] = 0
+            else:
+                action[1] = 0
+                action[3] = 1
+
+            # opp is below
+            if opp_pos[1] > y and abs(opp_pos[0]-x) < 2:
+                action[2] = 1
+
+        # dont kill yourself
+        if x < -6:
+            action[1] = 0
+            action[3] = 1
+        elif x > 6:
+            action[1] = 1
+            action[3] = 0
+        elif x > -2 and x < 2:
+            action[2] = 0
         return action
 
     def save(self, file_path: str) -> None:
@@ -83,29 +114,33 @@ class RecurrentPPOAgent(Agent):
     '''
     def __init__(
             self,
-            file_path: Optional[str] = None
+            total_timesteps: int = 54000,
+            file_path: Optional[str] = None,
     ):
         super().__init__(file_path)
         self.lstm_states = None
         self.episode_starts = np.ones((1,), dtype=bool)
+        self.total_timesteps = total_timesteps
 
     def _initialize(self) -> None:
         if self.file_path is None:
             policy_kwargs = {
                 'activation_fn': nn.ReLU,
                 'lstm_hidden_size': 512,
-                'net_arch': [dict(pi=[32, 32], vf=[32, 32])],
+                'net_arch': [dict(pi=[128, 128], vf=[128, 128])],
                 'shared_lstm': True,
                 'enable_critic_lstm': False,
                 'share_features_extractor': True,
+                'log_std_init': 0,
 
             }
             self.model = RecurrentPPO("MlpLstmPolicy",
                                       self.env,
                                       verbose=0,
-                                      n_steps=30*90*20,
+                                      learning_rate=3e-5,
+                                      n_steps=self.total_timesteps,
                                       batch_size=16,
-                                      ent_coef=0.05,
+                                      ent_coef=0.01,
                                       policy_kwargs=policy_kwargs)
             del self.env
         else:
@@ -117,6 +152,7 @@ class RecurrentPPOAgent(Agent):
     def predict(self, obs):
         action, self.lstm_states = self.model.predict(obs, state=self.lstm_states, episode_start=self.episode_starts, deterministic=True)
         if self.episode_starts: self.episode_starts = False
+        # print(action)
         return action
 
     def save(self, file_path: str) -> None:
@@ -183,6 +219,7 @@ class UserInputAgent(Agent):
         super().__init__(*args, **kwargs)
 
     def predict(self, obs):
+        print(obs[4],obs[5], obs[6], obs[7])
         action = self.act_helper.zeros()
        
         keys = pygame.key.get_pressed()
@@ -430,6 +467,7 @@ def danger_zone_reward(
 
     # Apply penalty if the player is in the danger zone
     reward = -zone_penalty if player.body.position.y >= zone_height else 0.0
+    reward = min(reward, -zone_penalty if (player.body.position.x <= -7 or player.body.position.x >= 7) else 0.0)
 
     return reward * env.dt
 
@@ -437,17 +475,6 @@ def in_state_reward(
     env: WarehouseBrawl,
     desired_state: Type[PlayerObjectState]=BackDashState,
 ) -> float:
-    """
-    Applies a penalty for every time frame player surpases a certain height threshold in the environment.
-
-    Args:
-        env (WarehouseBrawl): The game environment.
-        zone_penalty (int): The penalty applied when the player is in the danger zone.
-        zone_height (float): The height threshold defining the danger zone.
-
-    Returns:
-        float: The computed penalty as a tensor.
-    """
     # Get player object from the environment
     player: Player = env.objects["player"]
 
@@ -459,23 +486,56 @@ def in_state_reward(
 def head_to_middle_reward(
     env: WarehouseBrawl,
 ) -> float:
-    """
-    Applies a penalty for every time frame player surpases a certain height threshold in the environment.
-
-    Args:
-        env (WarehouseBrawl): The game environment.
-        zone_penalty (int): The penalty applied when the player is in the danger zone.
-        zone_height (float): The height threshold defining the danger zone.
-
-    Returns:
-        float: The computed penalty as a tensor.
-    """
     # Get player object from the environment
     player: Player = env.objects["player"]
 
     # Apply penalty if the player is in the danger zone
     multiplier = -1 if player.body.position.x > 0 else 1
     reward = multiplier * (player.body.position.x - player.prev_x)
+
+    return reward
+
+def consistent_movement_reward(
+    env: WarehouseBrawl,
+) -> float:
+    # Get player object from the environment
+    player: Player = env.objects["player"]
+
+    actions = player.cur_action
+    w, a, s, d, space = actions[0], actions[1], actions[2], actions[3], actions[4]
+    # w key doesn't seem to do anything?
+    # Vertically there is gravity and jumping is weird
+
+    # movement_arr = np.array([d - a, 0])  # x, y movement components
+    # movement_norm = np.linalg.norm(movement_arr)
+    x_movement = int(d>0.5) - int(a>0.5)
+    x_velocity = player.body.velocity.x
+    reward = x_movement * x_velocity / (abs(x_velocity) + 1e-6)
+
+    # velocity = np.array([player.body.velocity.x, player.body.velocity.y])
+    # velocity_norm = np.linalg.norm(velocity)
+
+    # if movement_norm < 1e-6 or velocity_norm < 1e-6:
+    #     return 0.0
+    
+    # reward = np.dot(movement_arr / movement_norm, velocity / velocity_norm)
+    return reward
+
+def moving_reward(
+    env: WarehouseBrawl,
+) -> float:
+
+    # Get player object from the environment
+    player: Player = env.objects["player"]
+
+    # Extracting player velocity from environment
+    # player_velocity = np.array([player.body.velocity.x, player.body.velocity.y])
+    # velocity_norm = np.linalg.norm(player_velocity)
+
+    # if velocity_norm < 1e-6:
+        # return 0.0
+
+    reward = min(player.body.velocity.x, 1)
 
     return reward
 
@@ -486,11 +546,62 @@ def head_to_opponent(
     # Get player object from the environment
     player: Player = env.objects["player"]
     opponent: Player = env.objects["opponent"]
+    
 
-    # Apply penalty if the player is in the danger zone
-    multiplier = -1 if player.body.position.x > opponent.body.position.x else 1
-    reward = multiplier * (player.body.position.x - player.prev_x)
+    # Extracting player velocity and position from environment
+    player_position_dif = np.array([player.body.velocity.x, player.body.velocity.y])
 
+    direction_to_opponent = np.array([opponent.body.position.x - player.body.position.x,
+                                      opponent.body.position.y - player.body.position.y])
+
+    # Prevent division by zero or extremely small values
+    direc_to_opp_norm = np.linalg.norm(direction_to_opponent)
+    player_pos_dif_norm = np.linalg.norm(player_position_dif)
+
+    if direc_to_opp_norm < 1e-6 or player_pos_dif_norm < 1e-6:
+        return 0.0
+
+    # Compute the dot product of the normalized vectors to figure out how much
+    # current movement (aka velocity) is in alignment with the direction they need to go in
+    reward = np.dot(player_position_dif / direc_to_opp_norm, direction_to_opponent / direc_to_opp_norm)
+
+    return reward
+
+def stock_advantage_reward(
+    env: WarehouseBrawl,
+    success_value: float = 0,
+) -> float:
+    # TODO:
+    player = env.objects["player"]
+    opponent = env.objects["opponent"]
+
+    if player.stocks > opponent.stocks:
+        pass
+    elif player.stocks < opponent.stocks:
+        pass
+
+    return 0.0
+
+def edge_guard_reward(
+    env: WarehouseBrawl,
+    success_value: float = 0,
+    fail_value: float = 0,
+) -> float:
+    player = env.objects["player"]
+    opponent = env.objects["opponent"]
+
+    ground1 = env.objects["ground1"]
+    ground2 = env.objects["ground2"]
+
+    if opponent.body.position.x < ground1.x:
+        pass
+    # ground 2
+    if opponent.body.position.x > ground2.x:
+        pass
+
+    # platform 1
+
+    reward = 0.0
     return reward
 
 def holding_more_than_3_keys(
@@ -537,28 +648,40 @@ def on_combo_reward(env: WarehouseBrawl, agent: str) -> float:
         return -1.0
     else:
         return 1.0
+    
 
 '''
 Add your dictionary of RewardFunctions here using RewTerms
 '''
-def gen_reward_manager():
+def gen_reward_manager(focus_on: list[str] = []):
     reward_functions = {
         #'target_height_reward': RewTerm(func=base_height_l2, weight=0.0, params={'target_height': -4, 'obj_name': 'player'}),
-        'danger_zone_reward': RewTerm(func=danger_zone_reward, weight=0.5),
-        'damage_interaction_reward': RewTerm(func=damage_interaction_reward, weight=1.0),
-        #'head_to_middle_reward': RewTerm(func=head_to_middle_reward, weight=0.01),
-        #'head_to_opponent': RewTerm(func=head_to_opponent, weight=0.05),
-        'penalize_attack_reward': RewTerm(func=in_state_reward, weight=-0.04, params={'desired_state': AttackState}),
-        'holding_more_than_3_keys': RewTerm(func=holding_more_than_3_keys, weight=-0.01),
-        #'taunt_reward': RewTerm(func=in_state_reward, weight=0.2, params={'desired_state': TauntState}),
+        'danger_zone_reward': RewTerm(func=danger_zone_reward, weight=1.0),
+        'damage_interaction_reward': RewTerm(func=damage_interaction_reward, weight=2.0),
+        'head_to_middle_reward': RewTerm(func=head_to_middle_reward, weight=0.1),
+        'head_to_opponent': RewTerm(func=head_to_opponent, weight=0.1),
+        # 'action_reward': RewTerm(func=action, weight=0.01, params={'agent': 'player'}),
+        'penalize_attack_reward': RewTerm(func=in_state_reward, weight=-0.1, params={'desired_state': AttackState}),
+        'holding_more_than_3_keys': RewTerm(func=holding_more_than_3_keys, weight=-0.1),
+        # 'edge_guard_reward': RewTerm(func=edge_guard_reward, weight=0.0),
+        # 'stock_advantage_reward': RewTerm(func=stock_advantage_reward, weight=0.0),
+        'consistent_movement_reward': RewTerm(func=consistent_movement_reward, weight=0.1),
+        'moving_reward': RewTerm(func=moving_reward, weight=0.1),
     }
     signal_subscriptions = {
         'on_win_reward': ('win_signal', RewTerm(func=on_win_reward, weight=50)),
-        'on_knockout_reward': ('knockout_signal', RewTerm(func=on_knockout_reward, weight=8)),
+        'on_knockout_reward': ('knockout_signal', RewTerm(func=on_knockout_reward, weight=10)),
         'on_combo_reward': ('hit_during_stun', RewTerm(func=on_combo_reward, weight=5)),
         'on_equip_reward': ('weapon_equip_signal', RewTerm(func=on_equip_reward, weight=10)),
-        'on_drop_reward': ('weapon_drop_signal', RewTerm(func=on_drop_reward, weight=15))
+        'on_drop_reward': ('weapon_drop_signal', RewTerm(func=on_drop_reward, weight=20))
     }
+    for key in focus_on:
+        if key in reward_functions:
+            reward_functions[key].weight *= 10
+        elif key in signal_subscriptions:
+            signal_subscriptions[key][1].weight *= 10
+        else:
+            print(f"Warning: Reward function '{key}' not found.")
     return RewardManager(reward_functions, signal_subscriptions)
 
 # -------------------------------------------------------------------------
@@ -568,46 +691,96 @@ def gen_reward_manager():
 The main function runs training. You can change configurations such as the Agent type or opponent specifications here.
 '''
 if __name__ == '__main__':
-    # Create agent
-    my_agent = CustomAgent(sb3_class=PPO, extractor=MLPExtractor)
-
     # Start here if you want to train from scratch. e.g:
-    #my_agent = RecurrentPPOAgent()
+    resume_training = False
+    if input("Resume training? (y/n): ").lower() == 'y':
+        resume_training = True
 
     # Start here if you want to train from a specific timestep. e.g:
-    #my_agent = RecurrentPPOAgent(file_path='checkpoints/experiment_3/rl_model_120006_steps.zip')
+    if resume_training:
+        steps = input("Enter training step of previous model: ")
+        my_agent = SB3Agent(file_path=f'checkpoints/experiment_12/rl_model_{steps}_steps.zip')
+    else:
+        my_agent = SB3Agent()
 
     # Reward manager
     reward_manager = gen_reward_manager()
     # Self-play settings
     selfplay_handler = SelfPlayRandom(
-        partial(type(my_agent)), # Agent class and its keyword arguments
+        partial(type(my_agent)) # Agent class and its keyword arguments
                                  # type(my_agent) = Agent class
     )
 
     # Set save settings here:
-    save_handler = SaveHandler(
-        agent=my_agent, # Agent to save
-        save_freq=100_000, # Save frequency
-        max_saved=40, # Maximum number of saved models
-        save_path='checkpoints', # Save path
-        run_name='experiment_9',
-        mode=SaveHandlerMode.FORCE # Save mode, FORCE or RESUME
-    )
+    if resume_training:
+        save_handler = SaveHandler(
+            agent=my_agent, # Agent to save
+            save_freq=99999, # Save frequency
+            max_saved=40, # Maximum number of saved models
+            save_path='checkpoints', # Save path
+            run_name='experiment_13',
+            mode=SaveHandlerMode.FORCE # Save mode, FORCE or RESUME
+        )
+    else:
+        save_handler = SaveHandler(
+            agent=my_agent, # Agent to save
+            save_freq=499999, # Save frequency
+            max_saved=40, # Maximum number of saved models
+            save_path='checkpoints', # Save path
+            run_name='experiment_9',
+            mode=SaveHandlerMode.FORCE # Save mode, FORCE or RESUME
+        )
 
     # Set opponent settings here:
     opponent_specification = {
-                    'self_play': (8, selfplay_handler),
-                    'constant_agent': (0.5, partial(ConstantAgent)),
-                    'based_agent': (1.5, partial(BasedAgent)),
+                    'self_play': (0.8, selfplay_handler),
+                    'based_agent': (0.1, partial(BasedAgent)),
+                    'constant_agent': (0.1, partial(ConstantAgent)),
                 }
     opponent_cfg = OpponentsCfg(opponents=opponent_specification)
 
-    train(my_agent,
-        reward_manager,
-        save_handler,
-        opponent_cfg,
-        CameraResolution.LOW,
-        train_timesteps=1_000_000_000,
-        train_logging=TrainLogging.PLOT
-    )
+    if resume_training:
+        focus = input("Continue with focused training? (y/n): ").lower()
+        if focus == 'y':
+            focus_list = input("Enter reward functions to focus on (comma-separated): ").split(',')
+            focus_list = [f.strip() for f in focus_list]
+            reward_manager = gen_reward_manager(focus_on=focus_list)
+            print(f"Continuing training with focus on: {focus_list}")
+
+        train(my_agent,
+            reward_manager,
+            save_handler,
+            opponent_cfg,
+            CameraResolution.LOW,
+            train_timesteps=100_000,
+            train_logging=TrainLogging.PLOT
+        )
+        reward_manager = gen_reward_manager()
+        train(my_agent,
+            reward_manager,
+            save_handler,
+            opponent_cfg,
+            CameraResolution.LOW,
+            train_timesteps=5_000_000,
+            train_logging=TrainLogging.PLOT
+        )
+
+    else:
+        saves = 0
+        for focus in [[], [],
+                      ['moving_reward'], ['consistent_movement_reward'], ['danger_zone_reward'],
+                      ['head_to_middle_reward'], ['head_to_opponent'], 
+                      ['damage_interaction_reward'], ['penalize_attack_reward'],
+                      ['on_knockout_reward'], ['on_combo_reward'], ['on_drop_reward']]:
+            reward_manager = gen_reward_manager(focus_on=focus)
+            print(f"Training with focus on: {focus}")
+            train(my_agent,
+                reward_manager,
+                save_handler,
+                opponent_cfg,
+                CameraResolution.LOW,
+                train_timesteps=500_000,
+                train_logging=TrainLogging.PLOT
+            )
+            saves += 1
+            my_agent = SB3Agent(file_path=f'checkpoints/experiment_9/rl_model_{saves*500000}_steps.zip')

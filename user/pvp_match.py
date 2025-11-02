@@ -5,11 +5,12 @@ from user.my_agent import SubmittedAgent
 import pygame
 pygame.init()
 
-my_agent = UserInputAgent()
+my_agent = SubmittedAgent(file_path='checkpoints/experiment_12/rl_model_11643036_steps.zip')
 
 #Input your file path here in SubmittedAgent if you are loading a model:
-opponent = SubmittedAgent(file_path=None)
-
+# opponent = SubmittedAgent(file_path=None)
+# opponent = SB3Agent(file_path='checkpoints/experiment_9/rl_model_336052_steps.zip')
+opponent = UserInputAgent()
 match_time = 99999
 
 # Run a single real-time match
